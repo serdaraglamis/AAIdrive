@@ -3,7 +3,9 @@ package me.hufman.androidautoidrive.carapp
 import android.graphics.drawable.Drawable
 import android.util.Log
 import de.bmw.idrive.BMWRemotingServer
+import de.bmw.idrive.RemoteBMWRemotingServer
 import me.hufman.androidautoidrive.utils.GraphicsHelpers
+import org.apache.etch.bindings.java.support.Mailbox
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -50,6 +52,19 @@ class AMAppList<T: AMAppInfo>(val connection: BMWRemotingServer, val graphicsHel
 	}
 	private var amHandle: Int = createAm()
 	private val knownApps = HashMap<String, T>()        // keyed by amAppIdentifier
+	private val pendingApps = HashMap<String, Mailbox>()    // pending async AM creations
+
+	private val MailboxCloser = object: Mailbox.Notify {
+		override fun mailboxStatus(mailbox: Mailbox?, appIdentifier: Any?, p2: Boolean) {
+			if (mailbox?.isFull == true) {
+				mailbox.closeDelivery()
+				if (appIdentifier is String) synchronized(pendingApps) {
+					pendingApps.remove(appIdentifier)
+				}
+			}
+		}
+
+	}
 
 	fun getAMInfo(app: AMAppInfo): Map<Int, Any> {
 		val amInfo = mutableMapOf<Int, Any>(
@@ -103,11 +118,15 @@ class AMAppList<T: AMAppInfo>(val connection: BMWRemotingServer, val graphicsHel
 				}
 			}
 		}
+
+		// wait for any pending apps to finish
+		flushPending()
 	}
 
 	fun redrawApp(app: T) {
 		if (knownApps.containsKey(app.amAppIdentifier)) {
 			createApp(app)
+			flushPending()
 		}
 	}
 
@@ -130,8 +149,32 @@ class AMAppList<T: AMAppInfo>(val connection: BMWRemotingServer, val graphicsHel
 		}
 	}
 
+	/**
+	 * Creates the given AMAppInfo in the car
+	 * If the connection supports async, it will create in the background and save the mailbox to be flushed later
+	 */
 	private fun createApp(app: T) {
 		Log.d(TAG, "Creating am app for app ${app.name}")
-		connection.am_registerApp(amHandle, app.amAppIdentifier, getAMInfo(app))
+		if (connection is RemoteBMWRemotingServer) {
+			// register the AM without waiting for a response
+			val mailbox = connection._async._begin_am_registerApp(amHandle, app.amAppIdentifier, getAMInfo(app))
+			synchronized(pendingApps) {
+				pendingApps[app.amAppIdentifier] = mailbox
+			}
+			mailbox.registerNotify(MailboxCloser, app.amAppIdentifier, 0)
+		} else {
+			connection.am_registerApp(amHandle, app.amAppIdentifier, getAMInfo(app))
+		}
+	}
+
+	/** Waits up to 2 seconds for any pending async am_registerApp calls to complete */
+	private fun flushPending() {
+		Log.i(TAG, "Waiting for ${pendingApps.size} pending apps")
+		for (i in 0..20) {
+			if (pendingApps.isNotEmpty()) {
+				Thread.sleep(100)
+			}
+		}
+		Log.i(TAG, "Finished flushing pending apps")
 	}
 }
